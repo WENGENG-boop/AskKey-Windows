@@ -87,16 +87,22 @@ struct Ticket {
     summary: ApprovalSummary,
 }
 
+/// The credential IDs and revisions an approval showed, in request order.
+pub(crate) type Binding = Vec<(String, String)>;
+
 struct Operation {
     digest: String,
     status: Status,
     ticket: Option<Ticket>,
+    binding: Binding,
 }
 
 #[derive(Default)]
 struct State {
     operations: HashMap<String, Operation>,
     order: VecDeque<String>,
+    /// A pending approval expired since the presenter last heard about it.
+    expired_unreported: bool,
 }
 
 #[derive(Default)]
@@ -111,8 +117,9 @@ pub(crate) enum Begin {
     /// [`Approvals::start`], [`Approvals::request_approval`] or
     /// [`Approvals::abandon`].
     New,
-    /// The approval was consumed by this call; launch now.
-    Approved,
+    /// The approval was consumed by this call; launch now, but only with the
+    /// credential revisions it was bound to.
+    Approved(Binding),
     /// Still waiting for the person.
     Pending(ApprovalTicket),
     /// Already finished during this App runtime; return its status without
@@ -155,6 +162,9 @@ impl State {
                     Status::AwaitingApproval | Status::Approved
                 )
             {
+                if operation.status == Status::AwaitingApproval {
+                    self.expired_unreported = true;
+                }
                 operation.status = Status::Refused(RequestState::Expired);
             }
         }
@@ -180,6 +190,7 @@ impl State {
                 digest: digest.to_owned(),
                 status: Status::Resolving,
                 ticket: None,
+                binding: Vec::new(),
             },
         );
         self.order.push_back(operation_id.to_owned());
@@ -232,7 +243,7 @@ impl Approvals {
         match operation.status {
             Status::Approved => {
                 operation.status = Status::Running;
-                Ok(Begin::Approved)
+                Ok(Begin::Approved(operation.binding.clone()))
             }
             Status::AwaitingApproval => {
                 let ticket = operation
@@ -262,6 +273,7 @@ impl Approvals {
         &self,
         operation_id: &str,
         mut summary: ApprovalSummary,
+        binding: Binding,
     ) -> Result<ApprovalTicket, ErrorCode> {
         let mut state = self.lock();
         let pending = state
@@ -287,6 +299,7 @@ impl Approvals {
             .get_mut(operation_id)
             .ok_or(ErrorCode::InternalError)?;
         operation.status = Status::AwaitingApproval;
+        operation.binding = binding;
         operation.ticket = Some(Ticket {
             request_id: ticket.request_id.clone(),
             capability: ticket.capability.clone(),
@@ -388,6 +401,11 @@ impl Approvals {
         summaries
     }
 
+    /// Whether a pending approval expired since the last call.
+    pub(crate) fn take_expired(&self) -> bool {
+        std::mem::take(&mut self.lock().expired_unreported)
+    }
+
     pub(crate) fn cancel_all_pending(&self) -> usize {
         let mut state = self.lock();
         let mut cancelled = 0;
@@ -415,163 +433,5 @@ impl Approvals {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn summary() -> ApprovalSummary {
-        ApprovalSummary {
-            request_id: String::new(),
-            command_line: "git.exe push".into(),
-            executable: r"C:\Program Files\Git\cmd\git.exe".into(),
-            working_directory: r"C:\work".into(),
-            credential_names: vec!["GitHub".into()],
-            environment_variables: vec!["GH_TOKEN".into()],
-            caller_name: None,
-            caller_purpose: None,
-            created_at: 0,
-            expires_at: 0,
-        }
-    }
-
-    fn pending(approvals: &Approvals, operation: &str) -> ApprovalTicket {
-        assert_eq!(approvals.begin(operation, "digest").unwrap(), Begin::New);
-        approvals.request_approval(operation, summary()).unwrap()
-    }
-
-    #[test]
-    fn approval_is_consumed_once() {
-        let approvals = Approvals::default();
-        let ticket = pending(&approvals, "op");
-        assert_eq!(
-            approvals.begin("op", "digest").unwrap(),
-            Begin::Pending(ticket.clone())
-        );
-        approvals.decide(&ticket.request_id, true).unwrap();
-        assert_eq!(
-            approvals
-                .status(&ticket.request_id, &ticket.capability)
-                .unwrap(),
-            RequestState::Approved
-        );
-        assert_eq!(approvals.begin("op", "digest").unwrap(), Begin::Approved);
-        // A concurrent identical retry cannot consume it again.
-        assert_eq!(
-            approvals.begin("op", "digest"),
-            Err(ErrorCode::RequestRejected)
-        );
-        approvals.complete("op", 7);
-        assert_eq!(
-            approvals.begin("op", "digest").unwrap(),
-            Begin::Completed(7)
-        );
-    }
-
-    #[test]
-    fn changed_payload_is_rejected() {
-        let approvals = Approvals::default();
-        let ticket = pending(&approvals, "op");
-        approvals.decide(&ticket.request_id, true).unwrap();
-        assert_eq!(
-            approvals.begin("op", "other-digest"),
-            Err(ErrorCode::RequestRejected)
-        );
-    }
-
-    #[test]
-    fn denial_and_cancellation_stop_the_operation() {
-        let approvals = Approvals::default();
-        let denied = pending(&approvals, "denied");
-        approvals.decide(&denied.request_id, false).unwrap();
-        assert_eq!(
-            approvals.begin("denied", "digest"),
-            Err(ErrorCode::RequestRejected)
-        );
-        assert_eq!(
-            approvals
-                .status(&denied.request_id, &denied.capability)
-                .unwrap(),
-            RequestState::Denied
-        );
-
-        let cancelled = pending(&approvals, "cancelled");
-        assert_eq!(
-            approvals
-                .cancel(&cancelled.request_id, &cancelled.capability)
-                .unwrap(),
-            RequestState::Cancelled
-        );
-        assert!(approvals.decide(&cancelled.request_id, true).is_err());
-    }
-
-    #[test]
-    fn wrong_capability_looks_unknown() {
-        let approvals = Approvals::default();
-        let ticket = pending(&approvals, "op");
-        assert_eq!(
-            approvals.status(&ticket.request_id, "guess"),
-            Err(ErrorCode::RequestNotFound)
-        );
-        assert_eq!(
-            approvals.cancel(&ticket.request_id, "guess"),
-            Err(ErrorCode::RequestNotFound)
-        );
-    }
-
-    #[test]
-    fn approvals_expire() {
-        let approvals = Approvals::default();
-        let ticket = pending(&approvals, "op");
-        approvals.decide(&ticket.request_id, true).unwrap();
-        approvals.expire_all_for_test();
-        assert_eq!(
-            approvals
-                .status(&ticket.request_id, &ticket.capability)
-                .unwrap(),
-            RequestState::Expired
-        );
-        assert_eq!(
-            approvals.begin("op", "digest"),
-            Err(ErrorCode::RequestRejected)
-        );
-        assert!(approvals.pending().is_empty());
-    }
-
-    #[test]
-    fn abandoned_operations_can_start_over() {
-        let approvals = Approvals::default();
-        assert_eq!(approvals.begin("op", "digest").unwrap(), Begin::New);
-        assert_eq!(
-            approvals.begin("op", "digest"),
-            Err(ErrorCode::RequestRejected)
-        );
-        approvals.abandon("op");
-        assert_eq!(approvals.begin("op", "digest").unwrap(), Begin::New);
-    }
-
-    #[test]
-    fn pause_cancels_pending() {
-        let approvals = Approvals::default();
-        let ticket = pending(&approvals, "op");
-        assert_eq!(approvals.cancel_all_pending(), 1);
-        assert_eq!(
-            approvals
-                .status(&ticket.request_id, &ticket.capability)
-                .unwrap(),
-            RequestState::Cancelled
-        );
-    }
-
-    #[test]
-    fn retention_keeps_active_operations() {
-        let approvals = Approvals::default();
-        for index in 0..Limits::MAX_RETAINED_OPERATIONS {
-            let id = format!("op-{index}");
-            assert_eq!(approvals.begin(&id, "d").unwrap(), Begin::New);
-            approvals.start(&id);
-            approvals.complete(&id, 0);
-        }
-        assert_eq!(approvals.begin("fresh", "d").unwrap(), Begin::New);
-        // The oldest completed operation was evicted.
-        assert_eq!(approvals.begin("op-0", "d").unwrap(), Begin::New);
-    }
-}
+#[path = "approvals_tests.rs"]
+mod tests;

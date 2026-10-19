@@ -25,7 +25,7 @@ pub use model::{
 };
 
 use crypto::VaultKeys;
-use model::{clean_group, validate_components, validate_usage, StoredMeta};
+use model::{clean_group, legacy_normalized_name, validate_components, validate_usage, StoredMeta};
 
 #[derive(Debug, thiserror::Error)]
 pub enum VaultError {
@@ -153,6 +153,7 @@ impl Vault {
             directory: directory.to_path_buf(),
         };
         vault.prune_access_records()?;
+        vault.rekey_legacy_names()?;
         Ok(vault)
     }
 
@@ -166,16 +167,22 @@ impl Vault {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn decode(&self, raw: &RawRow) -> Result<Credential> {
+    fn open_meta(&self, raw: &RawRow) -> Result<StoredMeta> {
         let fields = raw.authenticated_fields();
         self.keys.verify_record(
             &fields.iter().map(Vec::as_slice).collect::<Vec<_>>(),
             &raw.tag,
         )?;
         let meta_bytes = self.keys.open(&raw.meta, &meta_context(&raw.id))?;
-        let meta: StoredMeta =
-            serde_json::from_slice(&meta_bytes).map_err(|_| VaultError::Authentication)?;
-        if self.keys.name_key(&normalized_name(&meta.name)) != raw.name_key {
+        serde_json::from_slice(&meta_bytes).map_err(|_| VaultError::Authentication)
+    }
+
+    fn decode(&self, raw: &RawRow) -> Result<Credential> {
+        let meta = self.open_meta(raw)?;
+        let name_key = self.keys.name_key(&normalized_name(&meta.name));
+        if name_key != raw.name_key
+            && self.keys.name_key(&legacy_normalized_name(&meta.name)) != raw.name_key
+        {
             return Err(VaultError::Authentication);
         }
         Ok(Credential {
@@ -188,7 +195,36 @@ impl Vault {
             expires_at: raw.expires_at,
             created_at: raw.created_at,
             updated_at: raw.updated_at,
+            revision: raw.tag.iter().map(|byte| format!("{byte:02x}")).collect(),
         })
+    }
+
+    fn raw_rows(&self) -> Result<Vec<RawRow>> {
+        let connection = self.connection();
+        let mut statement = connection.prepare(&format!("SELECT {COLUMNS} FROM credentials"))?;
+        let rows = statement
+            .query_map([], RawRow::from_row)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Moves rows keyed by the first preview's lowercasing to full case
+    /// folding. A row whose folded name now collides keeps its old key.
+    fn rekey_legacy_names(&self) -> Result<()> {
+        for mut raw in self.raw_rows()? {
+            let meta = self.open_meta(&raw)?;
+            let name_key = self.keys.name_key(&normalized_name(&meta.name));
+            if name_key == raw.name_key {
+                continue;
+            }
+            raw.name_key = name_key;
+            raw.sign(&self.keys);
+            match self.write_row(&raw, false) {
+                Ok(()) | Err(VaultError::NameTaken) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
     }
 
     fn raw(&self, id: &str) -> Result<RawRow> {
@@ -205,16 +241,8 @@ impl Vault {
     /// Every credential, sorted by name. Fails if any row fails
     /// authentication rather than silently hiding it.
     pub fn list(&self) -> Result<Vec<Credential>> {
-        let rows: Vec<RawRow> = {
-            let connection = self.connection();
-            let mut statement =
-                connection.prepare(&format!("SELECT {COLUMNS} FROM credentials"))?;
-            let rows = statement
-                .query_map([], RawRow::from_row)?
-                .collect::<rusqlite::Result<_>>()?;
-            rows
-        };
-        let mut credentials = rows
+        let mut credentials = self
+            .raw_rows()?
             .iter()
             .map(|raw| self.decode(raw))
             .collect::<Result<Vec<_>>>()?;

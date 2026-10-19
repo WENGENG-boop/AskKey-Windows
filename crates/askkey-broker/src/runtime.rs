@@ -10,16 +10,25 @@ use askkey_protocol::{
 };
 use askkey_system::{
     build_command_line, duplicate_stream_handles, null_handle, resolve_executable, spawn_in_job,
-    SpawnSpec,
+    JobChild, SpawnSpec,
 };
 
-use crate::approvals::{executable_name, ApprovalSummary, Begin};
+use crate::approvals::{executable_name, ApprovalSummary, Begin, Binding};
 use crate::environment::lookup;
 use crate::{Access, AccessEvent, AccessOutcome, Broker, ResolvedCredential};
 
 struct Resolved {
     credentials: Vec<ResolvedCredential>,
     executable: PathBuf,
+}
+
+impl Resolved {
+    fn binding(&self) -> Binding {
+        self.credentials
+            .iter()
+            .map(|credential| (credential.id.clone(), credential.revision.clone()))
+            .collect()
+    }
 }
 
 fn ok(result: RunResult) -> BrokerResponse {
@@ -158,7 +167,11 @@ impl Broker {
             Err(code) => return BrokerResponse::Error(code),
         };
         let operation = request.operation_id.clone();
-        let begin = match self.approvals.begin(&operation, &request.digest()) {
+        let begin = self.approvals.begin(&operation, &request.digest());
+        if self.approvals.take_expired() {
+            self.notify();
+        }
+        let begin = match begin {
             Ok(begin) => begin,
             Err(code) => return BrokerResponse::Error(code),
         };
@@ -171,7 +184,7 @@ impl Broker {
             }
             Begin::Completed(code) => return ok(RunResult::Exited(code)),
             Begin::OutcomeUnknown => return ok(RunResult::OutcomeUnknown),
-            Begin::Approved => true,
+            Begin::Approved(binding) => Some(binding),
             Begin::New => {
                 let resolved = match self.resolve(&request, &directory) {
                     Ok(resolved) => resolved,
@@ -189,7 +202,11 @@ impl Broker {
                     .any(|credential| credential.access == Access::Ask)
                 {
                     let summary = self.summary(&request, &directory, &resolved);
-                    return match self.approvals.request_approval(&operation, summary) {
+                    let binding = resolved.binding();
+                    return match self
+                        .approvals
+                        .request_approval(&operation, summary, binding)
+                    {
                         Ok(ticket) => {
                             self.notify();
                             ok(RunResult::ApprovalRequired {
@@ -201,11 +218,17 @@ impl Broker {
                     };
                 }
                 self.approvals.start(&operation);
-                false
+                None
             }
         };
         match self
-            .launch(&request, &directory, approved, client_pid, disconnected)
+            .launch(
+                &request,
+                &directory,
+                approved.as_ref(),
+                client_pid,
+                disconnected,
+            )
             .await
         {
             Ok(response) => response,
@@ -218,26 +241,40 @@ impl Broker {
     }
 
     /// The final launch boundary: re-check everything the authorization
-    /// depended on, then decrypt and deliver.
-    async fn launch<D: Future<Output = ()>>(
-        self: &Arc<Self>,
+    /// depended on, then decrypt, deliver and create the process, all while
+    /// holding the gate that pause and credential changes wait on.
+    fn authorize_and_spawn(
+        &self,
         request: &RunRequest,
         directory: &Path,
-        approved: bool,
+        approved: Option<&Binding>,
         client_pid: u32,
-        disconnected: D,
-    ) -> Result<BrokerResponse, ErrorCode> {
+    ) -> Result<JobChild, ErrorCode> {
+        let _gate = self
+            .gate
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if self.provider.agent_access_paused() {
             return Err(ErrorCode::AgentAccessPaused);
         }
         let resolved = self.resolve(request, directory)?;
-        if !approved
-            && resolved
-                .credentials
-                .iter()
-                .any(|credential| credential.access != Access::Allow)
-        {
-            return Err(ErrorCode::RequestRejected);
+        match approved {
+            // The approval covers exactly the credential revisions it showed;
+            // an edit, permission change or re-creation needs a new one.
+            Some(binding) => {
+                if &resolved.binding() != binding {
+                    return Err(ErrorCode::RequestRejected);
+                }
+            }
+            None => {
+                if resolved
+                    .credentials
+                    .iter()
+                    .any(|credential| credential.access != Access::Allow)
+                {
+                    return Err(ErrorCode::RequestRejected);
+                }
+            }
         }
 
         let mut environment: Vec<(String, String)> = request
@@ -248,7 +285,10 @@ impl Broker {
             .collect();
         let mut delivered = Vec::new();
         for credential in &resolved.credentials {
-            delivered.extend(self.provider.deliver(&credential.id)?);
+            delivered.extend(
+                self.provider
+                    .deliver(&credential.id, &credential.revision)?,
+            );
         }
         // Delivered values replace inherited variables of the same name.
         environment.extend(
@@ -283,10 +323,21 @@ impl Broker {
             zeroize::Zeroize::zeroize(value);
         }
         drop(streams);
-        let child = Arc::new(child.map_err(|_| ErrorCode::InternalError)?);
+        child.map_err(|_| ErrorCode::InternalError)
+    }
+
+    async fn launch<D: Future<Output = ()>>(
+        self: &Arc<Self>,
+        request: &RunRequest,
+        directory: &Path,
+        approved: Option<&Binding>,
+        client_pid: u32,
+        disconnected: D,
+    ) -> Result<BrokerResponse, ErrorCode> {
+        let child = Arc::new(self.authorize_and_spawn(request, directory, approved, client_pid)?);
         self.record(
             request,
-            if approved {
+            if approved.is_some() {
                 AccessOutcome::Approved
             } else {
                 AccessOutcome::Allowed

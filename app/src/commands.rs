@@ -122,13 +122,26 @@ pub fn list_credentials(state: State<'_, AppState>) -> CommandResult<Vec<Credent
     state.vault.list().map_err(vault_error)
 }
 
+/// Allow lets agents use a credential without asking, so setting it needs
+/// proof that the person is present, also on creation.
+async fn confirm_allow(window: &WebviewWindow, name: &str) -> CommandResult<()> {
+    authenticate(window, &format!("Let agents use \"{name}\" without asking")).await
+}
+
 #[tauri::command]
-pub fn create_credential(
+pub async fn create_credential(
+    window: WebviewWindow,
     state: State<'_, AppState>,
     input: NewCredential,
 ) -> CommandResult<Credential> {
     require_session(&state)?;
-    state.vault.create(input).map_err(vault_error)
+    if input.permission == Permission::Allow {
+        confirm_allow(&window, input.name.trim()).await?;
+    }
+    state
+        .broker
+        .exclusive(|| state.vault.create(input))
+        .map_err(vault_error)
 }
 
 #[tauri::command]
@@ -138,7 +151,10 @@ pub fn update_credential(
     input: CredentialUpdate,
 ) -> CommandResult<Credential> {
     require_session(&state)?;
-    state.vault.update(&id, input).map_err(vault_error)
+    state
+        .broker
+        .exclusive(|| state.vault.update(&id, input))
+        .map_err(vault_error)
 }
 
 #[tauri::command]
@@ -150,7 +166,10 @@ pub async fn delete_credential(
     require_session(&state)?;
     let name = state.vault.get(&id).map_err(vault_error)?.name;
     authenticate(&window, &format!("Delete \"{name}\" from Ask Key")).await?;
-    state.vault.delete(&id).map_err(vault_error)
+    state
+        .broker
+        .exclusive(|| state.vault.delete(&id))
+        .map_err(vault_error)
 }
 
 #[tauri::command]
@@ -161,19 +180,13 @@ pub async fn set_permission(
     permission: Permission,
 ) -> CommandResult<Credential> {
     require_session(&state)?;
-    // Allow lets agents use a credential without asking, so it needs proof
-    // that the person is present.
     if permission == Permission::Allow {
         let name = state.vault.get(&id).map_err(vault_error)?.name;
-        authenticate(
-            &window,
-            &format!("Let agents use \"{name}\" without asking"),
-        )
-        .await?;
+        confirm_allow(&window, &name).await?;
     }
     state
-        .vault
-        .set_permission(&id, permission)
+        .broker
+        .exclusive(|| state.vault.set_permission(&id, permission))
         .map_err(vault_error)
 }
 
@@ -235,7 +248,10 @@ pub async fn set_agent_access_paused(
     if !paused {
         authenticate(&window, "Resume agent access to Ask Key").await?;
     }
-    state.provider.set_paused(paused).map_err(vault_error)?;
+    state
+        .broker
+        .exclusive(|| state.provider.set_paused(paused))
+        .map_err(vault_error)?;
     if paused {
         state.broker.cancel_pending();
     }

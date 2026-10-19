@@ -104,6 +104,7 @@ impl CredentialProvider for VaultProvider {
                 name: credential.name.clone(),
                 access,
                 expired: credential.is_expired(askkey_vault::now()),
+                revision: credential.revision.clone(),
                 environment_variables: credential
                     .components
                     .iter()
@@ -113,8 +114,15 @@ impl CredentialProvider for VaultProvider {
         }))
     }
 
-    fn deliver(&self, credential_id: &str) -> Result<Vec<(String, Zeroizing<String>)>, ErrorCode> {
+    fn deliver(
+        &self,
+        credential_id: &str,
+        revision: &str,
+    ) -> Result<Vec<(String, Zeroizing<String>)>, ErrorCode> {
         let credential = self.vault.get(credential_id).map_err(internal)?;
+        if credential.revision != revision {
+            return Err(ErrorCode::RequestRejected);
+        }
         let values = self.vault.values(credential_id).map_err(internal)?;
         Ok(credential
             .components

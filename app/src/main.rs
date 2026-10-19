@@ -125,7 +125,8 @@ fn main() {
                     "open" => show_main(app),
                     "pause" => {
                         let state = app.state::<AppState>();
-                        if state.provider.set_paused(true).is_ok() {
+                        let paused = state.broker.exclusive(|| state.provider.set_paused(true));
+                        if paused.is_ok() {
                             state.broker.cancel_pending();
                             let _ = app.emit("settings-changed", ());
                         }

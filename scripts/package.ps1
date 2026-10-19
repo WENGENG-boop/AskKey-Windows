@@ -19,7 +19,7 @@ $overlay = Join-Path $root "target\tauri.release.json"
 
 Push-Location app
 try {
-    npx --yes @tauri-apps/cli@2 build --config $overlay
+    npx --yes @tauri-apps/cli@2.12.3 build --config $overlay
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 } finally {
     Pop-Location

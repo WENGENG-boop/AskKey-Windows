@@ -45,7 +45,7 @@ DPAPI can be unwrapped by any process running as the same user. macOS's App-only
 
 ### Approvals
 
-As in AskKey's ADR 0002: one ticket per operation, bound to the SHA-256 digest of the whole run request (operation ID, command, credentials, working directory, inherited environment, caller declarations). The ticket is consumed at most once, expires after five minutes, and is queried and cancelled only with its capability. Caller name and purpose are shown as unverified. By default, approving needs Windows Hello; turning that off needs Windows Hello and an unlocked management session. Allow permission also needs Windows Hello to set. Pausing agent access cancels pending tickets, and resuming needs Windows Hello.
+As in AskKey's ADR 0002: one ticket per operation, bound to the SHA-256 digest of the whole run request (operation ID, command, credentials, working directory, inherited environment, caller declarations), and to the IDs and revisions of the credentials it showed: editing, re-permissioning, or deleting and re-creating a credential under the same name invalidates it. The final launch check, decryption and process creation run under one gate that pausing and credential changes also take, so a pause or change that wins that boundary prevents launch. The ticket is consumed at most once, expires after five minutes, and is queried and cancelled only with its capability. Caller name and purpose are shown as unverified. By default, approving needs Windows Hello; turning that off needs Windows Hello and an unlocked management session. Allow permission also needs Windows Hello to set, including on a new credential. Pausing agent access cancels pending tickets, and resuming needs Windows Hello.
 
 ### Distribution
 

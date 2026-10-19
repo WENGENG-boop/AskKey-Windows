@@ -215,3 +215,59 @@ fn rejects_invalid_input() {
     bad_variable.components[0].environment_variable = Some("NOT-VALID".into());
     assert!(vault.create(bad_variable).is_err());
 }
+
+#[test]
+fn revision_changes_on_every_write() {
+    let directory = tempfile::tempdir().unwrap();
+    let vault = Vault::open(directory.path(), NAMESPACE).unwrap();
+    let created = vault.create(synthetic("Revisioned")).unwrap();
+    assert_eq!(vault.get(&created.id).unwrap().revision, created.revision);
+    let allowed = vault
+        .set_permission(&created.id, Permission::Allow)
+        .unwrap();
+    assert_ne!(allowed.revision, created.revision);
+    let mut update = CredentialUpdate {
+        name: "Revisioned".into(),
+        usage_instructions: String::new(),
+        group: None,
+        components: vec![component("user", Some("SYNTH_USER"), None)],
+        expires_at: None,
+    };
+    let edited = vault.update(&created.id, update.clone()).unwrap();
+    assert_ne!(edited.revision, allowed.revision);
+    update.components[0].value = Some("synthetic-other".into());
+    assert_ne!(
+        vault.update(&created.id, update).unwrap().revision,
+        edited.revision
+    );
+}
+
+#[test]
+fn names_are_unique_under_full_case_folding() {
+    let directory = tempfile::tempdir().unwrap();
+    let vault = Vault::open(directory.path(), NAMESPACE).unwrap();
+    let id = vault.create(synthetic("Stra\u{df}e")).unwrap().id;
+    assert!(matches!(
+        vault.create(synthetic("STRASSE")),
+        Err(VaultError::NameTaken)
+    ));
+    assert_eq!(vault.find_by_name("strasse").unwrap().unwrap().id, id);
+}
+
+#[test]
+fn rows_keyed_by_the_first_preview_are_rekeyed() {
+    let directory = tempfile::tempdir().unwrap();
+    let id = {
+        let vault = Vault::open(directory.path(), NAMESPACE).unwrap();
+        let id = vault.create(synthetic("Stra\u{df}e")).unwrap().id;
+        let mut raw = vault.raw(&id).unwrap();
+        raw.name_key = vault.keys.name_key(&legacy_normalized_name("Stra\u{df}e"));
+        raw.sign(&vault.keys);
+        vault.write_row(&raw, false).unwrap();
+        assert!(vault.find_by_name("STRASSE").unwrap().is_none());
+        id
+    };
+    let vault = Vault::open(directory.path(), NAMESPACE).unwrap();
+    assert_eq!(vault.find_by_name("STRASSE").unwrap().unwrap().id, id);
+    assert_eq!(vault.list().unwrap().len(), 1);
+}

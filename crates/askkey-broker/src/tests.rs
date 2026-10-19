@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use askkey_protocol::{
     read_frame, write_frame, BrokerPayload, BrokerRequest, BrokerResponse, CatalogItem, ErrorCode,
@@ -21,6 +22,10 @@ struct FakeProvider {
     credentials: Mutex<Vec<FakeCredential>>,
     paused: AtomicBool,
     events: Mutex<Vec<AccessEvent>>,
+    /// Makes delivery slow, to hold a launch inside its final boundary.
+    deliver_delay: Mutex<Option<Duration>>,
+    delivering: AtomicBool,
+    delivered: AtomicBool,
 }
 
 impl FakeProvider {
@@ -31,6 +36,7 @@ impl FakeProvider {
                 name: name.into(),
                 access,
                 expired: false,
+                revision: "1".into(),
                 environment_variables: vec![variable.into()],
             },
             values: vec![(variable.into(), value.into())],
@@ -44,6 +50,23 @@ impl FakeProvider {
                 credential.resolved.access = access;
             }
         }
+    }
+
+    /// An edit in the App: new value, new revision.
+    fn edit(&self, name: &str, value: &str) {
+        for credential in self.credentials.lock().unwrap().iter_mut() {
+            if credential.resolved.name == name {
+                credential.values[0].1 = value.into();
+                credential.resolved.revision.push('+');
+            }
+        }
+    }
+
+    fn remove(&self, name: &str) {
+        self.credentials
+            .lock()
+            .unwrap()
+            .retain(|credential| credential.resolved.name != name);
     }
 
     fn hide(&self, name: &str) {
@@ -76,12 +99,21 @@ impl CredentialProvider for FakeProvider {
             .map(|credential| credential.resolved.clone()))
     }
 
-    fn deliver(&self, credential_id: &str) -> Result<Vec<(String, Zeroizing<String>)>, ErrorCode> {
+    fn deliver(
+        &self,
+        credential_id: &str,
+        revision: &str,
+    ) -> Result<Vec<(String, Zeroizing<String>)>, ErrorCode> {
+        self.delivering.store(true, Ordering::SeqCst);
+        if let Some(delay) = *self.deliver_delay.lock().unwrap() {
+            std::thread::sleep(delay);
+        }
+        self.delivered.store(true, Ordering::SeqCst);
         let credentials = self.credentials.lock().unwrap();
         let credential = credentials
             .iter()
-            .find(|c| c.resolved.id == credential_id)
-            .ok_or(ErrorCode::RequestNotFound)?;
+            .find(|c| c.resolved.id == credential_id && c.resolved.revision == revision)
+            .ok_or(ErrorCode::RequestRejected)?;
         Ok(credential
             .values
             .iter()
@@ -95,11 +127,12 @@ impl CredentialProvider for FakeProvider {
 }
 
 #[derive(Default)]
-struct CountingPresenter(AtomicUsize);
+struct CountingPresenter(AtomicUsize, Mutex<Vec<usize>>);
 
 impl ApprovalPresenter for CountingPresenter {
-    fn pending_changed(&self, _pending: usize) {
+    fn pending_changed(&self, pending: usize) {
         self.0.fetch_add(1, Ordering::SeqCst);
+        self.1.lock().unwrap().push(pending);
     }
 }
 
@@ -235,6 +268,95 @@ async fn changed_retry_is_rejected() {
         run(&broker, changed).await,
         BrokerResponse::Error(ErrorCode::RequestRejected)
     );
+}
+
+fn approval_required(response: &BrokerResponse) -> bool {
+    matches!(
+        response,
+        BrokerResponse::Ok(BrokerPayload::Run(RunResult::ApprovalRequired { .. }))
+    )
+}
+
+#[tokio::test]
+async fn edit_after_approval_needs_a_new_approval() {
+    let (broker, provider, _) = setup();
+    provider.add("Code", Access::Ask, "SYNTH_CODE", "11");
+    let request = exit_with("SYNTH_CODE", "op-edit", &["Code"]);
+    let _ = run(&broker, request.clone()).await;
+    let id = broker.pending_approvals()[0].request_id.clone();
+    broker.decide(&id, true).unwrap();
+    provider.edit("Code", "12");
+    assert_eq!(
+        run(&broker, request.clone()).await,
+        BrokerResponse::Error(ErrorCode::RequestRejected)
+    );
+    // Nothing ran, and the retry asks again for the edited credential.
+    assert!(provider.events.lock().unwrap().is_empty());
+    assert!(approval_required(&run(&broker, request.clone()).await));
+    let id = broker.pending_approvals()[0].request_id.clone();
+    broker.decide(&id, true).unwrap();
+    assert_eq!(run(&broker, request).await, exited(12));
+}
+
+#[tokio::test]
+async fn recreated_credential_needs_a_new_approval() {
+    let (broker, provider, _) = setup();
+    provider.add("Code", Access::Ask, "SYNTH_CODE", "11");
+    let request = exit_with("SYNTH_CODE", "op-recreate", &["Code"]);
+    let _ = run(&broker, request.clone()).await;
+    let id = broker.pending_approvals()[0].request_id.clone();
+    broker.decide(&id, true).unwrap();
+    provider.remove("Code");
+    provider.add("Code", Access::Ask, "SYNTH_CODE", "13");
+    provider.credentials.lock().unwrap()[0].resolved.id = "id-Code-2".into();
+    assert_eq!(
+        run(&broker, request).await,
+        BrokerResponse::Error(ErrorCode::RequestRejected)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pause_waits_for_a_launch_inside_the_boundary() {
+    let (broker, provider, _) = setup();
+    provider.add("Code", Access::Allow, "SYNTH_CODE", "8");
+    *provider.deliver_delay.lock().unwrap() = Some(Duration::from_millis(300));
+    let launching = {
+        let broker = broker.clone();
+        tokio::spawn(
+            async move { run(&broker, exit_with("SYNTH_CODE", "op-race", &["Code"])).await },
+        )
+    };
+    while !provider.delivering.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // The pause cannot slip in between the final check and process creation.
+    let pause = {
+        let (broker, provider) = (broker.clone(), provider.clone());
+        tokio::task::spawn_blocking(move || {
+            broker.exclusive(|| {
+                provider.paused.store(true, Ordering::SeqCst);
+                provider.delivered.load(Ordering::SeqCst)
+            })
+        })
+    };
+    assert!(pause.await.unwrap(), "pause ran inside the launch boundary");
+    assert_eq!(launching.await.unwrap(), exited(8));
+    // After the pause won, nothing launches.
+    assert_eq!(
+        run(&broker, exit_with("SYNTH_CODE", "op-after", &["Code"])).await,
+        BrokerResponse::Error(ErrorCode::AgentAccessPaused)
+    );
+}
+
+#[tokio::test]
+async fn expiry_is_reported_before_the_next_approval() {
+    let (broker, provider, presenter) = setup();
+    provider.add("Code", Access::Ask, "SYNTH_CODE", "1");
+    let _ = run(&broker, exit_with("SYNTH_CODE", "op-old", &["Code"])).await;
+    broker.approvals.expire_all_for_test();
+    let _ = run(&broker, exit_with("SYNTH_CODE", "op-new", &["Code"])).await;
+    // 1 pending, then 0 after the expiry, then 1 again: the window is raised.
+    assert_eq!(*presenter.1.lock().unwrap(), vec![1, 0, 1]);
 }
 
 #[tokio::test]

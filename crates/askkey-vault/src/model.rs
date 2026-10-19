@@ -70,6 +70,9 @@ pub struct Credential {
     pub expires_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
+    /// Changes on every write to the credential, including its permission.
+    #[serde(skip)]
+    pub revision: String,
 }
 
 impl Credential {
@@ -130,8 +133,23 @@ pub fn display_name(raw: &str) -> Result<String, VaultError> {
     Ok(name)
 }
 
-/// Key used for uniqueness: NFC plus case folding.
+/// Key used for uniqueness: NFC plus full case folding, so `Straße`,
+/// `STRASSE` and `strasse` are one name. Lowercasing, uppercasing and
+/// lowercasing again reaches the same equivalence classes as Unicode full
+/// case folding without another dependency.
 pub fn normalized_name(display: &str) -> String {
+    display
+        .nfc()
+        .flat_map(char::to_lowercase)
+        .flat_map(char::to_uppercase)
+        .flat_map(char::to_lowercase)
+        .nfc()
+        .collect()
+}
+
+/// The key the first preview release used, which only lowercased. Rows
+/// written by it are re-keyed when the library opens.
+pub(crate) fn legacy_normalized_name(display: &str) -> String {
     display.nfc().flat_map(char::to_lowercase).nfc().collect()
 }
 
@@ -210,6 +228,9 @@ mod tests {
         assert_eq!(normalized_name("GitHub"), normalized_name("github"));
         // "é" precomposed and decomposed.
         assert_eq!(normalized_name("caf\u{e9}"), normalized_name("cafe\u{301}"));
+        assert_eq!(normalized_name("Stra\u{df}e"), normalized_name("STRASSE"));
+        assert_eq!(normalized_name("STRA\u{1e9e}E"), normalized_name("strasse"));
+        assert_eq!(normalized_name("\u{fb01}le"), normalized_name("FILE"));
         assert!(display_name("   ").is_err());
         assert_eq!(display_name("  NAS  ").unwrap(), "NAS");
     }

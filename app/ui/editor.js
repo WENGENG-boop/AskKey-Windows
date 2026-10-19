@@ -4,6 +4,14 @@
 
 // ---------- Editor ----------
 
+// The date input's value for a stored expiry, in local time like the
+// 23:59:59 the editor stores, so reopening and saving keeps the same day.
+function localDate(seconds) {
+  const date = new Date(seconds * 1000);
+  const pad = (number) => String(number).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
 function componentRow(component, editing) {
   const row = h("div", { class: "component-row" },
     h("input", { class: "component-name", value: component?.name ?? "", placeholder: t("editor.componentName"), "aria-label": t("editor.componentName"), required: true }),
@@ -30,7 +38,7 @@ function openEditor(credential) {
   );
   const expiry = h("input", {
     type: "date",
-    value: credential?.expiresAt ? new Date(credential.expiresAt * 1000).toISOString().slice(0, 10) : "",
+    value: credential?.expiresAt ? localDate(credential.expiresAt) : "",
   });
   const form = h("form", {
     method: "dialog",

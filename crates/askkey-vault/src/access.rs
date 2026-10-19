@@ -33,6 +33,8 @@ pub struct AccessRecord {
 }
 
 impl Vault {
+    /// Also drops records past the retention window, because the App can stay
+    /// running far longer than that.
     pub fn record_access(&self, mut record: AccessRecord) -> Result<()> {
         record.at = now();
         let encoded =
@@ -42,11 +44,12 @@ impl Vault {
             "INSERT INTO access_records (at, record) VALUES (?1, ?2)",
             params![record.at, sealed],
         )?;
-        Ok(())
+        self.prune_access_records()
     }
 
     /// Most recent records first.
     pub fn access_records(&self, limit: usize) -> Result<Vec<AccessRecord>> {
+        self.prune_access_records()?;
         let sealed: Vec<Vec<u8>> = {
             let connection = self.connection();
             let mut statement = connection
